@@ -17,6 +17,17 @@
   不随后续读盘变化。镜像中缺失位置补零；**实际读到的全零扇区正常保存、
   不算缺失**（与补零位置可通过缺失清单区分）。
 - 重复上报幂等；单条非法扇区不拖垮整批，错误在 `rejected` 中逐条返回。
+- **批量上报容错**：某个扇区写入或「fsync / rename / 目录 fsync」确认落盘
+  失败时，该扇区计入 `failed` / `need_reread`（编号列表，详细错误见
+  `failed_sectors`，同时也并入 `rejected`），服务端继续尝试同批剩余扇区，
+  接口仍返回 200 而不是整批 HTTP 500。失败扇区会被清理/隔离，因此在
+  `GET /api/sectors/<N>`（409）、`/api/job`、`/api/missing` 与之后新建的
+  快照里都算缺失，重启后仍在缺失清单中、可重新补读成功。
+- **缓存与真相分离**：扇区走完落盘确认后即报保存成功（`saved_now`）；
+  此后即使 `job.json` 进度缓存写入失败，也只在 `cache_warning` / `warning`
+  中提示（`cache_ok: false`），不改变保存成功结论。内存进度当场正确，
+  重启时由 `sectors/` 扫描认回；`job.json` 缺失/损坏且 `sample.img` 还在时
+  会按样盘大小与哈希重建任务元数据。
 
 ## 目录结构
 
@@ -101,6 +112,11 @@ python3 scripts/sim_reader.py --base http://localhost:8000 \
 python3 -I tests/run.py               # 38 个单元测试
 python3 -I tests/integration_test.py  # 中断重启补读、边读边下载
 python3 -I tests/smoke_test.py        # 经 sim_reader 走真实 HTTP 的冒烟
+
+# 本次修复新增的故障注入自测（不影响 tests/ 原有 38 个用例）：
+python3 -I selftest/test_faults.py             # 进程内 API/存储故障用例 6 项
+python3 -I selftest/live_fault_selftest.py     # 真 gunicorn + 真权限故障 + 两次重启
+python3 -I selftest/live_fault_selftest.py --flask  # 同上，改用 wsgi.py
 ```
 
 ## 设计说明与边界

@@ -29,6 +29,21 @@
   pre { background: #8882; padding: .75rem; border-radius: 6px; overflow: auto;
         max-height: 16rem; font-size: .8rem; }
   .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
+  .sector-list { font-family: ui-monospace, monospace; font-size: .82rem;
+                 line-height: 1.7; word-break: break-all; margin: .35rem 0 0; }
+  .sector-list .chip { display: inline-block; padding: .05rem .45rem; margin: .1rem;
+                       border-radius: 999px; border: 1px solid #8885; }
+  .chip.saved { background: #2d9c5f22; border-color: #2d9c5f66; }
+  .chip.already { opacity: .65; }
+  .chip.reread { background: #b3363622; border-color: #b3363688; color: #e06a6a;
+                 font-weight: 600; }
+  .chip.rejected { background: #c77c1f22; border-color: #c77c1f88; color: #d99a44; }
+  .warn { background: #c77c1f22; border: 1px solid #c77c1f88; color: #d99a44;
+          padding: .5rem .75rem; border-radius: 6px; font-size: .85rem;
+          margin-top: .6rem; }
+  .ok-note { color: #2d9c5f; }
+  details.missing-box { margin-top: .6rem; }
+  details.missing-box summary { cursor: pointer; font-size: .85rem; }
 </style>
 </head>
 <body>
@@ -60,6 +75,8 @@
     <button id="report-btn">上报</button>
     <span id="report-result" class="muted"></span>
   </div>
+  <div id="report-warning"></div>
+  <div id="report-detail"></div>
 </section>
 
 <section>
@@ -79,6 +96,9 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+));
 
 async function refresh() {
   try {
@@ -92,6 +112,9 @@ async function refresh() {
     const p = j.progress;
     const pct = p.sector_count ? (100 * p.saved_count / p.sector_count).toFixed(1) : 0;
     $('progress').className = '';
+    const missingChips = (p.missing || [])
+      .map((n) => `<span class="chip reread" title="该扇区仍缺失，需要补读">${esc(n)}</span>`)
+      .join('');
     $('progress').innerHTML = `
       <table>
         <tr><th>总扇区</th><td>${p.sector_count}</td>
@@ -102,7 +125,12 @@ async function refresh() {
       </table>
       <div class="bar" style="margin-top:.6rem"><i style="width:${pct}%"></i></div>
       <p class="muted" style="margin-bottom:0">${pct}%
-        ${p.complete ? '— 全部扇区已救出 ✅' : ''}</p>`;
+        ${p.complete ? '— 全部扇区已救出 ✅' : ''}</p>
+      ${p.missing_count ? `
+      <details class="missing-box" ${p.missing_count <= 64 ? 'open' : ''}>
+        <summary>需补读的缺失扇区编号（${p.missing_count}）</summary>
+        <p class="sector-list">${missingChips}</p>
+      </details>` : ''}`;
   } catch (e) { /* 轮询失败静默 */ }
 }
 setInterval(refresh, 2000);
@@ -118,19 +146,74 @@ $('upload-form').addEventListener('submit', async (e) => {
   refresh();
 });
 
+function chipList(items, cls) {
+  if (!items || !items.length) return '<span class="muted">无</span>';
+  return items.map((n) => `<span class="chip ${cls}">${esc(n)}</span>`).join('');
+}
+
+function renderReportDetail(j) {
+  // 需补读：优先用后端专门字段；兼容只在 rejected 里返回落盘错误的版本。
+  const reread = (j.need_reread || j.failed || []).slice();
+  const rereadSet = new Set(reread);
+  const failedDetails = j.failed_sectors || j.write_errors || [];
+  const errBySector = {};
+  failedDetails.forEach((d) => { errBySector[d.sector] = d.error; });
+
+  // rejected 中不属于落盘失败的，才是真正的非法/解析拒收。
+  const rejected = (j.rejected || []).filter((r) => !rereadSet.has(r.sector));
+  rejected.forEach((r) => { if (!(r.sector in errBySector)) errBySector[r.sector] = r.error; });
+  // rejected 里若带了落盘失败条目而后端没给 failed 字段，也补进需补读清单。
+  (j.rejected || []).forEach((r) => {
+    if (r && typeof r.sector === 'number' && /写入|落盘|fsync|OSError|EIO|ENOSPC/i.test(r.error || '')) {
+      if (!rereadSet.has(r.sector)) { reread.push(r.sector); rereadSet.add(r.sector); }
+    }
+  });
+  reread.sort((a, b) => a - b);
+
+  $('report-warning').innerHTML = j.warning || j.cache_warning
+    ? `<div class="warn">⚠️ ${esc(j.warning || j.cache_warning)}</div>` : '';
+
+  $('report-detail').innerHTML = `
+    <div style="margin-top:.75rem">
+      <p style="margin:.4rem 0 .15rem"><span class="ok-note">✅ 已保存（新写入 ${j.saved_now.length}）</span></p>
+      <p class="sector-list">${chipList(j.saved_now, 'saved')}</p>
+      <p style="margin:.6rem 0 .15rem" class="muted">此前已保存（${j.already_saved.length}）</p>
+      <p class="sector-list">${chipList(j.already_saved, 'saved already')}</p>
+      <p style="margin:.6rem 0 .15rem"><span style="color:#e06a6a;font-weight:600">🔁 需补读编号（${reread.length}）</span>
+         <span class="muted">——写入或确认落盘失败，进度/读取/新快照均仍算缺失，可稍后重新上报（鼠标悬停看原因）</span></p>
+      <p class="sector-list">${reread.map((n) =>
+        `<span class="chip reread" title="${esc(errBySector[n] || '写入或确认落盘失败')}">${esc(n)}</span>`).join('') || '<span class="muted">无</span>'}</p>
+      ${rejected.length ? `
+      <p style="margin:.6rem 0 .15rem;color:#d99a44;font-weight:600">⛔ 拒收（${rejected.length}，数据或编号非法）</p>
+      <p class="sector-list">${rejected.map((r) =>
+        `<span class="chip rejected" title="${esc(errBySector[r.sector] || r.error || '')}">${esc(r.sector)}</span>`).join('')}
+      </p>` : ''}`;
+}
+
 $('report-btn').addEventListener('click', async () => {
   let body;
   try { body = JSON.parse($('payload').value || '{}'); }
   catch (err) { $('report-result').textContent = 'JSON 解析失败：' + err; return; }
-  const r = await fetch('/api/sectors', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const j = await r.json();
-  if (!r.ok) { $('report-result').textContent = '失败：' + j.error; return; }
+  let r, j;
+  try {
+    r = await fetch('/api/sectors', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    j = await r.json();
+  } catch (err) {
+    $('report-result').textContent = '请求失败（服务异常？）：' + err;
+    return;
+  }
+  if (!r.ok) { $('report-result').textContent = '失败：' + (j.error || r.status); return; }
+  const rereadIds = j.need_reread || j.failed || [];
+  const rereadIdSet = new Set(rereadIds);
+  const invalidCount = (j.rejected || []).filter((x) => !rereadIdSet.has(x.sector)).length;
   $('report-result').textContent =
-    `新写入 ${j.saved_now.length} 个，已存在 ${j.already_saved.length} 个，拒收 ${j.rejected.length} 个`;
+    `新写入 ${j.saved_now.length} 个，已存在 ${j.already_saved.length} 个，` +
+    `需补读 ${rereadIds.length} 个，拒收 ${invalidCount} 个`;
+  renderReportDetail(j);
   refresh();
 });
 
@@ -156,6 +239,9 @@ $('reset-btn').addEventListener('click', async () => {
   $('snapshot-links').innerHTML = '';
   $('missing-preview').hidden = true;
   $('snapshot-info').textContent = '';
+  $('report-detail').innerHTML = '';
+  $('report-warning').innerHTML = '';
+  $('report-result').textContent = '';
   refresh();
 });
 </script>

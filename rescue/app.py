@@ -201,6 +201,16 @@ def create_app(data_dir: str | None = None) -> Flask:
     def not_found(err):
         return _error(404, getattr(err, "description", "资源不存在"))
 
+    @app.errorhandler(500)
+    def internal_error(err):
+        # 兜底：批量上报内部已逐扇区容错，正常不会走到这里；
+        # 即便有意外错误，也返回 JSON，避免脚本拿到 HTML 500。
+        app.logger.exception("internal error: %s", err)
+        return _error(
+            500,
+            "服务器内部错误；已确认落盘的扇区不会丢失，可重新拉取缺失清单补报",
+        )
+
     return app
 
 
